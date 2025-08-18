@@ -15,7 +15,27 @@ from langchain_community.chat_models import ChatLlamaCpp
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.callbacks.base import BaseCallbackHandler
 from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
+import platform
 
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+BASE_DIR = Path(__file__).resolve().parent
+
+def rel_path(env_var, default_rel):
+    val = os.getenv(env_var)
+    if val:
+        return Path(val).expanduser()
+    return (BASE_DIR / default_rel)
+
+PIPER_MODEL_PATH = rel_path("PIPER_MODEL_PATH", "voice/en_US-libritts-high.onnx")
+PIPER_CONFIG_PATH = rel_path("PIPER_CONFIG_PATH", "voice/en_US-libritts-high.onnx.json")
+LLM_MODEL_PATH = rel_path("LLM_MODEL_PATH", "model/gpt-oss-20b-mxfp4.gguf")
 
 class TTSCallbackHandler(BaseCallbackHandler):
     def __init__(self):
@@ -47,7 +67,7 @@ _lock = Lock()
 
 # LLM configuration via environment variables with sensible defaults
 llm = ChatLlamaCpp(
-    model_path=os.getenv("LLM_MODEL_PATH", "model/qwen2.5-1.5b-instruct.gguf"),
+    model_path=os.getenv("LLM_MODEL_PATH", "model/gpt-oss-20b-mxfp4.gguf"),
     n_ctx=int(os.getenv("LLM_N_CTX", "4096")),
     temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
     max_tokens=int(os.getenv("LLM_MAX_TOKENS", "512")),
@@ -69,16 +89,45 @@ prompt = ChatPromptTemplate.from_messages(
 WAKE_WORD = "SAMURAI"
 CONVERSATION_TIMEOUT = 20
 
+def choose_samplerate(desired=16000):
+    try:
+        sd.check_input_settings(samplerate=desired, channels=1, dtype="float32")
+        return desired
+    except Exception:
+        default = int(sd.query_devices(kind="input")["default_samplerate"])
+        try:
+            sd.check_input_settings(samplerate=default, channels=1, dtype="float32")
+            return default
+        except Exception:
+            # final fallback – pick the first with mono support
+            for dev in sd.query_devices():
+                try:
+                    sd.check_input_settings(device=dev["name"], samplerate=dev["default_samplerate"], channels=1, dtype="float32")
+                    return int(dev["default_samplerate"])
+                except Exception:
+                    continue
+            raise RuntimeError("No compatible input device found.")
+
+def maybe_resample(audio, from_sr, to_sr=16000):
+    if from_sr == to_sr:
+        return audio
+    # Minimal resampling without extra deps (ok for speech, upgrade to soxr for HQ)
+    import math
+    ratio = to_sr / from_sr
+    x = np.arange(int(len(audio) * ratio)) / ratio
+    idx = np.floor(x).astype(int)
+    idx = np.clip(idx, 0, len(audio) - 1)
+    return audio[idx]
 
 def get_tts():
     global _tts
     if _tts is None:
         with _lock:
             if _tts is None:
-                model = os.getenv("PIPER_MODEL_PATH", "voice/en_US-lessac-high.onnx")
+                model = os.getenv("PIPER_MODEL_PATH", "voice/en_US-libritts-high.onnx")
                 cfg = os.getenv(
                     "PIPER_CONFIG_PATH",
-                    "voice/en_US-lessac-high.onnx.json",
+                    "voice/en_US-libritts-high.onnx.json",
                 )
                 if not (os.path.isfile(model) and os.path.isfile(cfg)):
                     raise FileNotFoundError("Missing Piper model/config")
@@ -222,46 +271,37 @@ def speak(text: str, blocking: bool = True, volume: float = 1.0):
 
 
 def listen():
-    duration = 5
-    samplerate = 16000
-    beam_size = 1
-    language = "en"
+    target_sr = 16000
+    in_sr = choose_samplerate(target_sr)
+    frames = int(5 * in_sr)  # 5 seconds
+    buf = sd.rec(frames, samplerate=in_sr, channels=1, dtype="float32")
+    sd.wait()
+    audio = buf.reshape(-1)
+    audio_16k = maybe_resample(audio, from_sr=in_sr, to_sr=target_sr)
 
-    try:
-        stop_speaking()
-        time.sleep(0.1)
-        sd.check_input_settings(samplerate=samplerate, channels=1, dtype="float32")
-        logging.info("Listening...")
-        frames = int(duration * samplerate)
-        buf = np.empty((frames, 1), dtype=np.float32)
-        sd.rec(
-            frames,
-            samplerate=samplerate,
-            channels=1,
-            dtype="float32",
-            out=buf,
-        )
-        sd.wait()
-        logging.info("Recording finished, transcribing...")
-
-        audio = buf.reshape(-1)
-
-        # Transcribe
-        segments, info = get_whisper().transcribe(
-            audio,
-            temperature=0.0,
-            beam_size=beam_size,
-            vad_filter=True,
-            language=language,
-        )
-        text = " ".join(segment.text for segment in segments)
-        return text
-    except Exception:
-        logging.exception("Audio capture/transcription failed")
-        return ""
+    segments, _ = get_whisper().transcribe(
+        audio_16k,
+        temperature=0.0,
+        beam_size=1,
+        vad_filter=True,
+        language="en",
+    )
+    return " ".join(s.text for s in segments)
 
 
 def main():
+    if not (PIPER_MODEL_PATH.is_file() and PIPER_CONFIG_PATH.is_file()):
+        raise FileNotFoundError(f"Missing Piper files: {PIPER_MODEL_PATH} / {PIPER_CONFIG_PATH}")
+    
+    try:
+        sd.check_input_settings(samplerate=choose_samplerate(), channels=1, dtype="float32")
+    except Exception as e:
+        logging.error("Input audio device not compatible. Consider selecting a different microphone or changing Windows sound settings (sample rate / exclusive mode).")
+        raise
+
+    if any(ord(c) > 127 for c in str(BASE_DIR)):
+        logging.warning("Project path contains non-ASCII characters. If native libs fail to load models, move models to an ASCII-only directory and set paths via .env.")
+
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )

@@ -161,3 +161,25 @@ langchain-core>=0.2.12,<0.3
 langchain-community>=0.2.12,<0.3
 llama-cpp-python>=0.2.90,<0.3
 ```
+
+# Windows PowerShell
+
+```bash
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install python-dotenv numpy sounddevice piper-tts faster-whisper langchain-core langchain-community
+
+# llama-cpp-python CPU wheel:
+pip install llama-cpp-python
+```
+
+# Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install python-dotenv numpy sounddevice piper-tts faster-whisper langchain-core langchain-community
+pip install llama-cpp-python
+```

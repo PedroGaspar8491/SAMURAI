@@ -41,11 +41,8 @@ Thumbs.db
 
 # Environment files
 .env
-.env.*
 
 # Local models and voice assets (large binaries)
-model/
-voice/
 *.gguf
 *.onnx
 *.onnx.json
